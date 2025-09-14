@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UAV 경로 계획 대시보드 v5 (저장 기능 추가 - 버그 수정)</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css"/>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet-geosearch@3.11.0/dist/geosearch.css"/>
+    <style>
+        html, body, #map { height: 100%; width: 100%; margin: 0; padding: 0; overflow: hidden; }
+        #control-panel {
+            position: absolute; top: 10px; right: 10px; z-index: 1000;
+            background: rgba(255, 255, 255, 0.95); padding: 15px; border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.2); width: 380px; max-height: 95vh; overflow-y: auto;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+        h2 { margin-top: 0; }
+        textarea {
+            width: 95%; height: 120px; margin-top: 5px; font-family: monospace;
+            font-size: 12px; border: 1px solid #ddd; border-radius: 4px; padding: 8px; resize: vertical;
+        }
+        .action-button {
+            border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer;
+            font-size: 16px; width: 100%; margin-top: 10px; transition: background-color 0.2s;
+        }
+        .action-button.primary { background-color: #007bff; color: white; }
+        .action-button.primary:hover:enabled { background-color: #0056b3; }
+        .action-button.secondary { background-color: #28a745; color: white; }
+        .action-button.secondary:hover:enabled { background-color: #218838; }
+        .action-button.danger { background-color: #dc3545; color: white; }
+        .action-button.danger:hover { background-color: #c82333; }
+        .action-button.success { background-color: #28a745; color: white; }
+        .action-button.success:hover:enabled { background-color: #218838; }
+        .action-button:disabled { background-color: #cccccc; cursor: not-allowed; }
+        .action-button.active { background-color: #6c757d; opacity: 0.8; }
+        #status {
+            padding: 10px; margin-bottom: 10px; background-color: #e9ecef;
+            border-radius: 4px; text-align: center; font-size: 14px; font-weight: bold;
+        }
+        .leaflet-draw { display: none; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+
+    <div id="control-panel">
+        <h2>UAV 경로 계획</h2>
+        <div id="status">원하는 작업을 선택하세요.</div>
+
+        <button id="home-btn" class="action-button primary" onclick="enterMode('setHome')">① 홈 위치 선택하기</button>
+        <button id="area-btn" class="action-button primary" onclick="enterMode('drawArea')">② 수색 영역 그리기</button>
+        <button id="obstacle-btn" class="action-button secondary" onclick="enterMode('drawObstacle')" disabled>③ 장애물 추가하기</button>
+        <button class="action-button danger" onclick="clearAll()">전체 초기화</button>
+        
+        <hr style="margin: 20px 0;">
+
+        <div class="output-group">
+            <label for="polygonOutput"><strong>데이터 미리보기 (저장될 내용)</strong></label>
+            <textarea id="polygonOutput" readonly></textarea>
+        </div>
+        
+        <button id="save-btn" class="action-button success" onclick="generateFiles()" disabled>파일 저장</button>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+    <script src="https://unpkg.com/leaflet-geosearch@3.11.0/dist/geosearch.umd.js"></script>
+    <script>
+        var map, homeMarker = null, areaLayer = null, drawControl, statusPanel;
+        var obstacleLayers = [];
+        var currentMode = 'idle';
+        var homeBtn, areaBtn, obstacleBtn, saveBtn;
+
+        // --- 초기화 ---
+        statusPanel = document.getElementById('status');
+        homeBtn = document.getElementById('home-btn');
+        areaBtn = document.getElementById('area-btn');
+        obstacleBtn = document.getElementById('obstacle-btn');
+        saveBtn = document.getElementById('save-btn');
+
+        map = L.map('map').setView([37.5665, 126.9780], 13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap' }).addTo(map);
+
+        const searchControl = new GeoSearch.GeoSearchControl({ provider: new GeoSearch.OpenStreetMapProvider(), style: 'bar', autoClose: true, keepResult: true });
+        map.addControl(searchControl);
+
+        var drawnItems = new L.FeatureGroup().addTo(map);
+        drawControl = new L.Control.Draw({
+            edit: { featureGroup: drawnItems },
+            draw: { polygon: {}, polyline: false, rectangle: false, circle: false, marker: false, circlemarker: false }
+        });
+        map.addControl(drawControl);
+
+        // --- 이벤트 리스너 (v5 방식으로 복구) ---
+        map.on('click', e => {
+            if (currentMode === 'setHome') {
+                setHome(e.latlng);
+                enterMode('idle');
+            }
+        });
+        
+        map.on(L.Draw.Event.CREATED, e => {
+            const layer = e.layer;
+            if (currentMode === 'drawArea') {
+                if (areaLayer) drawnItems.removeLayer(areaLayer);
+                areaLayer = layer;
+                areaLayer.setStyle({ color: '#007bff', fillColor: '#007bff' });
+            } else if (currentMode === 'drawObstacle') {
+                obstacleLayers.push(layer);
+                layer.setStyle({ color: '#dc3545', fillColor: '#dc3545' });
+            }
+            drawnItems.addLayer(layer);
+            enterMode('idle');
+        });
+
+        map.on('draw:editstop draw:deletestop', () => {
+             if (areaLayer && !drawnItems.hasLayer(areaLayer)) { areaLayer = null; }
+             obstacleLayers = obstacleLayers.filter(layer => drawnItems.hasLayer(layer));
+             enterMode('idle');
+        });
+
+
+        // --- 핵심 로직: 상태 관리 ---
+        function enterMode(mode) {
+            if (drawControl._toolbars.draw._activeMode) {
+                drawControl._toolbars.draw._modes.polygon.handler.disable();
+            }
+            
+            currentMode = mode;
+            updateUIState();
+
+            [homeBtn, areaBtn, obstacleBtn].forEach(btn => btn.classList.remove('active'));
+            if (mode === 'setHome') homeBtn.classList.add('active');
+            if (mode === 'drawArea') areaBtn.classList.add('active');
+            if (mode === 'drawObstacle') obstacleBtn.classList.add('active');
+
+            switch(mode) {
+                case 'idle':
+                    statusPanel.textContent = "원하는 작업을 선택하세요.";
+                    homeBtn.textContent = homeMarker ? "다시 홈 위치 선택하기" : "① 홈 위치 선택하기";
+                    areaBtn.textContent = areaLayer ? "다시 수색 영역 그리기" : "② 수색 영역 그리기";
+                    break;
+                case 'setHome':
+                    statusPanel.textContent = "지도 위를 클릭하여 홈 위치를 지정하세요.";
+                    break;
+                case 'drawArea':
+                    if(areaLayer) { drawnItems.removeLayer(areaLayer); areaLayer = null; }
+                    new L.Draw.Polygon(map, { shapeOptions: { color: '#007bff' } }).enable();
+                    statusPanel.textContent = "지도에 수색 영역을 그리세요.";
+                    break;
+                case 'drawObstacle':
+                    new L.Draw.Polygon(map, { shapeOptions: { color: '#dc3545' } }).enable();
+                    statusPanel.textContent = "지도에 장애물 영역을 그리세요.";
+                    break;
+            }
+        }
+        
+        function updateUIState() {
+            obstacleBtn.disabled = !areaLayer;
+            saveBtn.disabled = !(homeMarker && areaLayer);
+            updatePreview();
+        }
+
+        // --- 보조 함수 ---
+        function setHome(latlng) {
+            if (homeMarker) map.removeLayer(homeMarker);
+            homeMarker = L.marker(latlng).addTo(map);
+        }
+
+        function formatPolygon(latlngs) {
+            let ring = latlngs[0];
+            if (!ring || ring.length < 3) return "Polygon([])";
+
+            // 마지막 점이 첫 점과 같으면 제거
+            const first = ring[0], last = ring[ring.length - 1];
+            if (first.lat.toFixed(6) === last.lat.toFixed(6) &&
+                first.lng.toFixed(6) === last.lng.toFixed(6)) {
+                ring = ring.slice(0, -1);
+            }
+
+            const coords = ring.map(p => `(${p.lng.toFixed(6)}, ${p.lat.toFixed(6)})`);
+            return `Polygon([\n        ${coords.join(',\n        ')}\n    ])`;
+        }
+
+        function updatePreview() {
+            let outputText = '';
+            if (homeMarker) {
+                 const lat = homeMarker.getLatLng().lat.toFixed(6), lon = homeMarker.getLatLng().lng.toFixed(6);
+                 outputText += `## Home Location (.wp)\nQGC WPL 110\n0\t1\t...\t${lat}\t${lon}\t10.0\t1\n\n`;
+            }
+            if (areaLayer) {
+                outputText += `## Polygons (.txt)\nA = ${formatPolygon(areaLayer.getLatLngs())}\n\n`;
+            }
+            if (obstacleLayers.length > 0) {
+                const hPolygons = obstacleLayers.map(layer => formatPolygon(layer.getLatLngs()));
+                outputText += `H = [\n    ${hPolygons.join(',\n    ')}\n]`;
+            }
+            document.getElementById('polygonOutput').value = outputText || '데이터가 없습니다.';
+        }
+
+        function generateFiles() {
+            if (!homeMarker || !areaLayer) {
+                alert("홈 위치와 수색 영역을 모두 지정해야 합니다.");
+                return;
+            }
+            const lat = homeMarker.getLatLng().lat.toFixed(6);
+            const lon = homeMarker.getLatLng().lng.toFixed(6);
+            const wpContent = `QGC WPL 110\n0\t1\t0\t16\t0\t0\t0\t0\t${lat}\t${lon}\t10.0\t1`;
+
+            let polyContent = `A = ${formatPolygon(areaLayer.getLatLngs())}\n\n`;
+            if (obstacleLayers.length > 0) {
+                const hPolygons = obstacleLayers.map(layer => formatPolygon(layer.getLatLngs()));
+                polyContent += `H = [\n    ${hPolygons.join(',\n    ')}\n]`;
+            }
+
+            downloadFile(`home.wp`, wpContent);
+            downloadFile(`polygon0.txt`, polyContent);
+            
+            statusPanel.textContent = "파일 생성이 완료되었습니다!";
+        }
+
+        function downloadFile(filename, text) {
+            var element = document.createElement('a');
+            element.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(text));
+            element.setAttribute('download', filename);
+            element.style.display = 'none';
+            document.body.appendChild(element);
+            element.click();
+            document.body.removeChild(element);
+        }
+
+        function clearAll() {
+            if (homeMarker) { map.removeLayer(homeMarker); homeMarker = null; }
+            drawnItems.clearLayers();
+            areaLayer = null;
+            obstacleLayers = [];
+            enterMode('idle');
+            statusPanel.textContent = '초기화 완료. 다시 시작하세요.';
+        }
+        
+        enterMode('idle');
+    </script>
+</body>
+</html>
